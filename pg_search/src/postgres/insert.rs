@@ -53,7 +53,7 @@ impl InsertState {
     ) -> anyhow::Result<Self> {
         let writer = SearchIndexWriter::open(indexrel, MvccSatisfies::Mergeable, writer_resources)?;
         let tupdesc = unsafe { PgTupleDesc::from_pg_unchecked(indexrel.rd_att) };
-        let categorized_fields = categorize_fields(&tupdesc, &writer.schema);
+        let categorized_fields = categorize_fields(&tupdesc, &writer.schema, indexrel);
         let key_field_name = writer.schema.key_field().name.0;
 
         let per_row_context = pg_sys::AllocSetContextCreateExtended(

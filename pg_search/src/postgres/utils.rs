@@ -20,7 +20,9 @@ use crate::postgres::types::TantivyValue;
 use crate::schema::{SearchDocument, SearchField, SearchIndexSchema};
 use anyhow::{anyhow, Result};
 use chrono::{NaiveDate, NaiveTime};
+use pg_sys::FileSetDeleteAll;
 use pgrx::itemptr::{item_pointer_get_both, item_pointer_set_all};
+use pgrx::pg_sys::{AsPgCStr, PgNode};
 use pgrx::*;
 use std::str::FromStr;
 
@@ -84,21 +86,60 @@ pub struct CategorizedFieldData {
     pub is_array: bool,
     pub is_json: bool,
 }
-
-pub fn categorize_fields(
+pub unsafe fn categorize_fields(
     tupdesc: &PgTupleDesc,
     schema: &SearchIndexSchema,
+    indexrel: &PgRelation,
 ) -> Vec<(SearchField, CategorizedFieldData)> {
     let mut categorized_fields = Vec::new();
 
     let mut alias_lookup = schema.alias_lookup();
 
-    // Create a vector of index entries from the postgres row.
-    for (attno, attribute) in tupdesc.iter().enumerate() {
-        let attname = attribute.name().to_string();
-        let attribute_type_oid = attribute.type_oid();
+    let heaprel = indexrel
+        .heap_relation()
+        .expect("index relation should have a heap relation");
+    let tupdesc = heaprel.tuple_desc();
 
-        // List any indexed fields that use this column as source data.
+    let index_info = unsafe { pg_sys::BuildIndexInfo(indexrel.as_ptr()) };
+
+    let expressions = unsafe { PgList::<pg_sys::Expr>::from_pg((*index_info).ii_Expressions) };
+    let mut expressions_iter = expressions.iter_ptr();
+    let mut expr_idx = 0 as usize;
+    for i in 0..(*index_info).ii_NumIndexAttrs {
+        let heap_attno = (*index_info).ii_IndexAttrNumbers[i as usize];
+        let (attno, attname, attribute_type_oid) = if heap_attno == 0 {
+            let Some(expression) = expressions_iter.next() else {
+                panic!("Expected expression for index attribute {i}.");
+            };
+            expr_idx += 1;
+            let node = expression.cast();
+
+            let expression_str = unsafe {
+                let pg_cstr = pg_sys::deparse_expression(
+                    node,
+                    pg_sys::deparse_context_for(heaprel.name().as_pg_cstr(), heaprel.oid()),
+                    false,
+                    false,
+                );
+                let expression_str = core::ffi::CStr::from_ptr(pg_cstr)
+                    .to_str()
+                    .expect("Invalid UTF8 in result of deparse_expression.")
+                    .to_owned();
+
+                pg_sys::pfree(pg_cstr.cast());
+                expression_str
+            };
+            (expr_idx, expression_str, pg_sys::exprType(node))
+        } else {
+            // Is a column
+            let attno = heap_attno as usize - 1;
+            let attribute = tupdesc
+                .get(attno)
+                .expect("attribute should exist for valid indkey");
+            let att_name = attribute.name().to_string();
+            let atttypid = attribute.type_oid().value();
+            (attno, att_name, atttypid)
+        };
         let mut search_fields = alias_lookup.remove(&attname).unwrap_or_default();
 
         // If there's an indexed field with the same name as a this column, add it to the list.
@@ -107,11 +148,11 @@ pub fn categorize_fields(
         };
 
         for search_field in search_fields {
-            let array_type = unsafe { pg_sys::get_element_type(attribute_type_oid.value()) };
+            let array_type = unsafe { pg_sys::get_element_type(attribute_type_oid) };
             let (base_oid, is_array) = if array_type != pg_sys::InvalidOid {
                 (PgOid::from(array_type), true)
             } else {
-                (attribute_type_oid, false)
+                (PgOid::from(attribute_type_oid), false)
             };
 
             let is_json = matches!(
@@ -130,7 +171,6 @@ pub fn categorize_fields(
             ));
         }
     }
-
     categorized_fields
 }
 
